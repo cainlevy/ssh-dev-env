@@ -1,0 +1,108 @@
+#!/bin/sh
+
+fetch_instance () {
+  aws ec2 describe-instances \
+    --filters Name=tag:Owner,Values=$AWS_USER \
+    | jq -r .Reservations[0].Instances[0]
+}
+
+fetch_security_group () {
+  aws ec2 describe-security-groups \
+    --filters Name=tag:Owner,Values=$AWS_USER \
+    | jq -r .SecurityGroups[0]
+}
+
+open_ssh_port () {
+  MY_IP=$(curl -s 'https://api.ipify.org')
+  SG_ID=$(fetch_security_group | jq -r .GroupId)
+
+  aws ec2 authorize-security-group-ingress \
+    --group-id=$(printf "$SG_ID") \
+    --ip-permissions "FromPort=22,ToPort=22,IpProtocol=tcp,IpRanges=[{CidrIp=$MY_IP/32,Description=SSH}]"
+}
+
+close_ssh_ports () {
+  SG=$(fetch_security_group)
+
+  for CIDR in $(printf "$SG" | jq -r '.IpPermissions | map(select(.FromPort == 22))[].IpRanges[].CidrIp'); do
+    aws ec2 revoke-security-group-ingress \
+      --group-id=$(printf "$SG" | jq -r .GroupId) \
+      --protocol=tcp --port=22 --cidr=$CIDR
+  done
+}
+
+resume () {
+  # start tagged instance
+  INSTANCE_ID=$(fetch_instance | jq -r .InstanceId)
+  aws ec2 start-instances --instance-ids $INSTANCE_ID > /dev/null
+
+  # report the public ip address when running
+  aws ec2 wait instance-running --instance-ids $INSTANCE_ID
+  sleep 3 # SSH isn't immediately available?
+  fetch_instance | jq -r .PublicIpAddress
+}
+
+# installs a dead man's switch using crontab and a keepalive file
+dead_man_switch () {
+  IP=$1
+  # use crontab to hibernate the server if .keepalive is more than 5 minutes old
+  ssh -oStrictHostKeyChecking=accept-new $IP \
+    "touch ~/.keepalive; echo '* * * * * find ~/ -type f -name .keepalive -mmin +5 | grep -q . && sudo shutdown now' | crontab"
+  while true; do
+    printf '.'
+    ssh -oStrictHostKeyChecking=accept-new $IP "touch ~/.keepalive"
+    sleep 60
+  done
+}
+
+hibernate () {
+  aws ec2 stop-instances \
+    --hibernate \
+    --instance-ids $(fetch_instance | jq -r .InstanceId) \
+    > /dev/null
+}
+
+usage () {
+    printf "usage: AWS_PROFILE=myprofile $0 -u me [resume|hibernate]\n"
+    printf "       AWS_PROFILE=myprofile AWS_USER=me $0 [resume|hibernate]\n"
+    printf "\n"
+}
+
+# courtesy: https://stackoverflow.com/a/14203146/4799185
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+  key="$1"
+
+  case $key in
+    -u|--user)
+      AWS_USER="$2"
+      shift # past argument
+      shift # past value
+      ;;
+    *)
+      POSITIONAL+=("$1") # save it in an array for later
+      shift # past argument
+      ;;
+  esac
+done
+set -- "${POSITIONAL[@]}" # restore positional parameters
+
+ACTION=$1
+
+case $ACTION in
+  resume)
+    close_ssh_ports
+    open_ssh_port
+    IP=$(resume)
+    printf "server: $IP\n"
+    dead_man_switch $IP
+    ;;
+  hibernate)
+    hibernate
+    close_ssh_ports
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac

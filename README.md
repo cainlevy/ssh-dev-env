@@ -11,3 +11,7 @@ You want portability and power, but a laptop is a poor trade. The development en
 Move your development environment into a rentable EC2 instance, and manage costs by only running it when you need it.
 
 The instance hibernates any time your computer idles. Resuming takes seconds.
+
+## Requirements
+
+* [AWS CLI](https://aws.amazon.com/cli/)
